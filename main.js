@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -6,17 +6,17 @@ const dgram = require('dgram');
 const { exec } = require('child_process');
 
 const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
+const SESSION_KEY = 'local';
 
 function loadSettings() {
   try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { return {}; }
 }
 function saveSettings(s) {
   fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ ...loadSettings(), ...s }, null, 2));
 }
 
 function resolveRemoteScriptsDir() {
-  // Try Ableton prefs
   const prefsRoot = path.join(os.homedir(), 'AppData', 'Roaming', 'Ableton');
   try {
     if (fs.existsSync(prefsRoot)) {
@@ -46,22 +46,19 @@ function detectAbleton() {
 }
 
 // --- OSC client -----------------------------------------------------------
-// Ableton's remote script listens on 11000 and replies to 11001.
 const OSC_SEND_PORT = 11000;
 const OSC_REPLY_PORT = 11001;
-
 let oscSocket = null;
-const oscPending = new Map(); // address -> { resolve, timer }
+const oscPending = new Map();
 
 function getOscSocket() {
   if (oscSocket) return oscSocket;
   oscSocket = dgram.createSocket('udp4');
   oscSocket.on('message', (buf) => {
     const addr = readOscString(buf, 0);
-    const key = addr.str;
-    const waiter = oscPending.get(key);
+    const waiter = oscPending.get(addr.str);
     if (waiter) {
-      oscPending.delete(key);
+      oscPending.delete(addr.str);
       clearTimeout(waiter.timer);
       waiter.resolve(parseOscArgs(buf));
     }
@@ -84,7 +81,10 @@ function oscSend(address, args = [], { expectReply = false, timeoutMs = 3000 } =
     }
     sock.send(msg, OSC_SEND_PORT, '127.0.0.1', (err) => {
       if (err) {
-        if (expectReply) { oscPending.delete(address); clearTimeout(oscPending.get(address)?.timer); }
+        if (expectReply) {
+          const w = oscPending.get(address);
+          if (w) { clearTimeout(w.timer); oscPending.delete(address); }
+        }
         reject(err);
       } else if (!expectReply) {
         resolve(true);
@@ -93,6 +93,32 @@ function oscSend(address, args = [], { expectReply = false, timeoutMs = 3000 } =
   });
 }
 
+function buildOscMessage(address, args) {
+  function oscStr(s) {
+    const b = Buffer.from(s + '\0');
+    const pad = 4 - (b.length % 4);
+    return Buffer.concat([b, Buffer.alloc(pad === 4 ? 0 : pad)]);
+  }
+  let typeTag = ',';
+  const argBufs = [];
+  for (const a of args) {
+    if (typeof a === 'string') { typeTag += 's'; argBufs.push(oscStr(a)); }
+    else if (typeof a === 'number') {
+      if (Number.isInteger(a)) { typeTag += 'i'; const b = Buffer.alloc(4); b.writeInt32BE(a); argBufs.push(b); }
+      else { typeTag += 'f'; const b = Buffer.alloc(4); b.writeFloatBE(a); argBufs.push(b); }
+    }
+  }
+  typeTag += '\0';
+  return Buffer.concat([oscStr(address), oscStr(typeTag), ...argBufs]);
+}
+function readOscString(buf, offset) {
+  let end = offset;
+  while (buf[end] !== 0) end++;
+  const str = buf.slice(offset, end).toString('ascii');
+  const next = end + 1;
+  const pad = 4 - (next % 4);
+  return { str, next: next + (pad === 4 ? 0 : pad) };
+}
 function parseOscArgs(buf) {
   const addr = readOscString(buf, 0);
   const tags = readOscString(buf, addr.next);
@@ -115,92 +141,291 @@ async function oscPing() {
     return Array.isArray(r.args) && r.args[0] === 'ok';
   } catch { return false; }
 }
-
 async function getTrackCount() {
   const r = await oscSend('/live/song/get/num_tracks', [], { expectReply: true });
   return Number(r.args[0]) || 0;
 }
-
 async function loadFileIntoSlot(trackIndex, clipIndex, filePath) {
   await oscSend('/live/clip_slot/load_file', [trackIndex, clipIndex, filePath], { expectReply: false });
   return { ok: true };
 }
 
-function buildOscMessage(address, args) {
-  // OSC string: address + type tag + args
-  function oscStr(s) {
-    const b = Buffer.from(s + '\0');
-    const pad = 4 - (b.length % 4);
-    return Buffer.concat([b, Buffer.alloc(pad === 4 ? 0 : pad)]);
-  }
-  let typeTag = ',';
-  const argBufs = [];
-  for (const a of args) {
-    if (typeof a === 'string') { typeTag += 's'; argBufs.push(oscStr(a)); }
-    else if (typeof a === 'number') { if (Number.isInteger(a)) { typeTag += 'i'; const b = Buffer.alloc(4); b.writeInt32BE(a); argBufs.push(b); } else { typeTag += 'f'; const b = Buffer.alloc(4); b.writeFloatBE(a); argBufs.push(b); } }
-  }
-  typeTag += '\0';
-  const ttBuf = oscStr(typeTag);
-  return Buffer.concat([oscStr(address), ttBuf, ...argBufs]);
-}
-function readOscString(buf, offset) {
-  let end = offset;
-  while (buf[end] !== 0) end++;
-  const str = buf.slice(offset, end).toString('ascii');
-  const next = end + 1;
-  const pad = 4 - (next % 4);
-  return { str, next: next + (pad === 4 ? 0 : pad) };
-}
-
+// --- window ---------------------------------------------------------------
 let mainWindow;
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 960, height: 680,
+    width: 1100, height: 760,
     minWidth: 720, minHeight: 520,
     title: 'Bridge',
-    backgroundColor: '#0a0a0a',
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false }
+    backgroundColor: '#000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'electron', 'api', 'loadApi.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
   });
   mainWindow.loadFile(path.join(__dirname, 'app', 'index.html'));
+  buildMenu();
+  if (process.env.BRIDGE_DEVTOOLS === '1') mainWindow.webContents.openDevTools({ mode: 'detach' });
+}
+
+function navigate(target) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('navigate-screen', target);
+}
+
+function buildMenu() {
+  const template = [
+    { role: 'fileMenu' },
+    { role: 'editMenu' },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    { role: 'windowMenu' },
+    {
+      label: 'Help',
+      submenu: [
+        { label: 'About Bridge', click: () => navigate('about') },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 
-// IPC
-ipcMain.handle('get-settings', () => loadSettings());
-ipcMain.handle('save-settings', (_e, s) => { saveSettings({ ...loadSettings(), ...s }); return true; });
-ipcMain.handle('detect-ableton', () => detectAbleton());
-ipcMain.handle('osc-ping', () => oscPing());
-ipcMain.handle('remote-scripts-dir', () => resolveRemoteScriptsDir());
-ipcMain.handle('install-remote-script', async () => {
-  const src = path.join(__dirname, 'ableton_bridge');
-  const dest = path.join(resolveRemoteScriptsDir(), 'ableton_bridge');
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  // copy
-  function copyDir(s, d) {
-    fs.mkdirSync(d, { recursive: true });
-    for (const f of fs.readdirSync(s)) {
-      const sp = path.join(s, f), dp = path.join(d, f);
-      if (fs.statSync(sp).isDirectory()) copyDir(sp, dp); else fs.copyFileSync(sp, dp);
-    }
-  }
-  copyDir(src, dest);
-  return { ok: true, dest };
+// --- IPC helpers ----------------------------------------------------------
+const handle = (channel, fn) => ipcMain.handle(channel, fn);
+
+const DEFAULTS = {
+  'ableton-connection-diagnostics-snapshot': null,
+  'ableton-state-snapshot': null,
+  'agent-acknowledge-project': null,
+  'agent-approve': null,
+  'agent-cancel': null,
+  'agent-chat-list': [],
+  'agent-chat-select': null,
+  'agent-create': null,
+  'agent-dismiss-notices': null,
+  'agent-insert-preview': null,
+  'agent-invalidate-oauth': null,
+  'agent-record-audition': null,
+  'agent-status': null,
+  'agent-transcript-clear': null,
+  'agent-transcript-snapshot': null,
+  'app-logs-download': null,
+  'app-logs-inventory': [],
+  'auto-update-check': { status: 'idle' },
+  'auto-update-install': { status: 'idle' },
+  'auto-update-status': { status: 'idle' },
+  'billing-open-plans': null,
+  'billing-premier-pricing': {},
+  'billing-start-checkout': null,
+  'cache-delete': null,
+  'cache-inventory': [],
+  'cache-view': null,
+  'clean-imports-reveal': null,
+  'clean-imports-run': { canceled: true },
+  'clean-imports-scan': { dir: '', exists: false, fileCount: 0, totalBytes: 0 },
+  'convert-build-zip': null,
+  'convert-cleanup-zip': null,
+  'convert-create': null,
+  'convert-preview-audio': null,
+  'convert-status': null,
+  'convert-sync-create': null,
+  'convert-upload': null,
+  'convert-upload-complete': null,
+  'credits-refresh': { sessionKey: SESSION_KEY, credits: 0 },
+  'credits-status': { sessionKey: SESSION_KEY, credits: 0 },
+  'deep-link-claim': null,
+  'deep-link-release': null,
+  'deep-link-status': null,
+  'downloads-folder-path': '',
+  'export-create': null,
+  'export-download': null,
+  'export-list-projects': [],
+  'export-project-state': null,
+  'export-status': null,
+  'factory-reset-execute': null,
+  'factory-reset-inventory': {},
+  'get-git-info': null,
+  'get-pending-navigation': null,
+  'http-traffic-clear': null,
+  'http-traffic-open-window': null,
+  'http-traffic-set-enabled': null,
+  'http-traffic-snapshot': null,
+  'linked-projects-link': null,
+  'linked-projects-list': [],
+  'linked-projects-read': [],
+  'notify-project-ready': null,
+  'oauth-avatar-failed': null,
+  'oauth-cancel': null,
+  'oauth-refresh-profile': null,
+  'oauth-sign-in': null,
+  'oauth-sign-out': null,
+  'onboarding-detect': null,
+  'onboarding-install': null,
+  'onboarding-reveal-install': null,
+  'onboarding-uninstall': null,
+  'open-privacy-settings': null,
+  'parse-midi-file': null,
+  'recent-projects-list': [],
+  'repair-folder-access': null,
+  'reveal-in-finder': null,
+  'scan-directory': [],
+  'scan-project-tree': { tracks: [], clips: [] },
+  'select-download-folder': null,
+  'settings-data-inventory': [],
+  'suno-control-reconnect': null,
+  'support-logs-copy': null,
+  'support-logs-download': null,
+  'support-logs-reveal': null,
+  'track-event': null,
+  'uninstall-app': null,
+  'view-remote-control-log-clear': null,
+  'view-remote-control-log-reveal': null,
+  'view-remote-control-log-save-snapshot': null,
+  'view-remote-control-log-snapshot': { path: '', status: 'idle', lines: [], lastError: null },
+};
+
+const OVERRIDDEN = new Set([
+  'oauth-status', 'oauth-get-token', 'get-has-completed-first-run', 'set-has-completed-first-run',
+  'get-app-info', 'get-app-name', 'get-app-version',
+  'check-for-ableton-process', 'ableton-open', 'ableton-restart',
+  'ableton-state-snapshot', 'ableton-connection-diagnostics-snapshot',
+  'bridge-setup-snapshot', 'bridge-setup-repair',
+  'onboarding-detect', 'onboarding-install', 'onboarding-uninstall', 'onboarding-reveal-install',
+  'suno-control-reconnect',
+  'select-folder', 'select-download-folder', 'pick-audio-file', 'pick-midi-file',
+  'settings-open-data-dir', 'settings-open-logs-dir', 'open-external', 'open-dev-tools', 'refresh-renderer',
+  'remote-control-create-audio-track', 'remote-control-send-audio-file',
+  'remote-control-create-midi-track', 'remote-control-send-midi-notes',
+  'remote-control-errors-snapshot', 'remote-control-errors-clear',
+  'remote-control-import-status-snapshot', 'remote-control-stop-import',
+  'load-file-into-slot', 'track-count', 'osc-ping', 'generate-music',
+]);
+
+for (const [channel, value] of Object.entries(DEFAULTS)) {
+  if (OVERRIDDEN.has(channel)) continue;
+  handle(channel, () => (typeof value === 'object' && value !== null ? JSON.parse(JSON.stringify(value)) : value));
+}
+
+// identity / first run
+handle('oauth-status', () => ({
+  signedIn: true, displayName: 'local', apiBase: 'local', avatarUrl: null,
+  userId: 'local', email: '', sessionKey: SESSION_KEY, canCreate: true,
+}));
+handle('oauth-get-token', () => 'local-token');
+handle('get-has-completed-first-run', () => true);
+handle('set-has-completed-first-run', () => true);
+handle('get-app-info', () => ({ name: 'bridge', version: app.getVersion(), packaged: app.isPackaged }));
+handle('get-app-name', () => 'Bridge');
+handle('get-app-version', () => app.getVersion());
+
+// ableton
+handle('check-for-ableton-process', () => detectAbleton());
+handle('ableton-open', () => launchLive());
+handle('ableton-restart', () => launchLive());
+handle('ableton-state-snapshot', () => null);
+handle('ableton-connection-diagnostics-snapshot', () => ({ bound: false, lastError: null }));
+handle('bridge-setup-snapshot', () => {
+  const dir = path.join(resolveRemoteScriptsDir(), 'ableton_bridge');
+  const installed = fs.existsSync(dir);
+  return {
+    installed, health: installed ? 'healthy' : 'missing', detail: null, lastError: null,
+    restartRequired: false, busy: false, automaticAction: null,
+    destPath: dir, remoteScriptsDir: resolveRemoteScriptsDir(),
+    live: { status: 'unknown' },
+  };
 });
-ipcMain.handle('generate-music', async (_e, opts) => {
+handle('bridge-setup-repair', () => installRemoteScript());
+handle('onboarding-detect', () => {
+  const dir = path.join(resolveRemoteScriptsDir(), 'ableton_bridge');
+  return { installed: fs.existsSync(dir), destPath: dir, remoteScriptsDir: resolveRemoteScriptsDir(), sourceDir: path.join(__dirname, 'ableton_bridge') };
+});
+handle('onboarding-install', () => installRemoteScript());
+handle('onboarding-uninstall', () => {
+  const dir = path.join(resolveRemoteScriptsDir(), 'ableton_bridge');
+  const removed = fs.existsSync(dir);
+  if (removed) fs.rmSync(dir, { recursive: true, force: true });
+  return { destPath: dir, removed };
+});
+handle('onboarding-reveal-install', () => shell.openPath(resolveRemoteScriptsDir()));
+handle('suno-control-reconnect', () => oscPing());
+
+// files
+handle('select-folder', () => dialog.showOpenDialog({ properties: ['openDirectory'] }).then(r => r.canceled ? null : r.filePaths[0]));
+handle('select-download-folder', () => dialog.showOpenDialog({ properties: ['openDirectory'] }).then(r => r.canceled ? null : r.filePaths[0]));
+handle('pick-audio-file', () => dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Audio', extensions: ['wav','mp3','aiff','flac'] }] }).then(r => r.canceled ? null : r.filePaths[0]));
+handle('pick-midi-file', () => dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'MIDI', extensions: ['mid','midi'] }] }).then(r => r.canceled ? null : r.filePaths[0]));
+handle('settings-open-data-dir', () => shell.openPath(app.getPath('userData')));
+handle('settings-open-logs-dir', () => shell.openPath(app.getPath('logs')));
+handle('open-external', (_e, url) => shell.openExternal(url));
+handle('open-dev-tools', async () => { if (mainWindow) mainWindow.webContents.openDevTools({ mode: 'detach' }); });
+handle('refresh-renderer', () => { if (mainWindow) mainWindow.webContents.reload(); });
+
+// remote control
+handle('remote-control-create-audio-track', () => getTrackCount().then(count => ({ trackIndex: count })));
+handle('remote-control-send-audio-file', (_e, opts) => loadFileIntoSlot(opts?.trackIndex ?? 0, opts?.clipIndex ?? 0, opts?.filePath));
+handle('remote-control-create-midi-track', () => null);
+handle('remote-control-send-midi-notes', () => null);
+handle('remote-control-errors-snapshot', () => []);
+handle('remote-control-errors-clear', () => null);
+handle('remote-control-import-status-snapshot', () => ({ active: false }));
+handle('remote-control-stop-import', () => null);
+
+// generated audio insert
+handle('load-file-into-slot', (_e, { trackIndex, clipIndex, filePath }) => loadFileIntoSlot(trackIndex, clipIndex, filePath));
+handle('track-count', () => getTrackCount());
+handle('osc-ping', () => oscPing());
+handle('generate-music', async (_e, opts) => {
   const settings = loadSettings();
   const apiKey = settings.elevenlabsApiKey || opts.apiKey;
   if (!apiKey) throw new Error('ElevenLabs API key not set');
   const music = require('./elevenlabs/music.js');
   const outDir = path.join(app.getPath('music'), 'Bridge', 'generated');
   fs.mkdirSync(outDir, { recursive: true });
-  const fileName = `gen-${Date.now()}.mp3`;
-  const dest = path.join(outDir, fileName);
+  const dest = path.join(outDir, `gen-${Date.now()}.mp3`);
   await music.composeToFile({ apiKey, prompt: opts.prompt, musicLengthMs: opts.durationMs, modelId: opts.modelId, forceInstrumental: opts.instrumental }, dest);
   return { ok: true, path: dest };
 });
-ipcMain.handle('open-path', (_e, p) => shell.openPath(p));
-ipcMain.handle('open-external', (_e, url) => shell.openExternal(url));
-ipcMain.handle('track-count', () => getTrackCount());
-ipcMain.handle('load-file-into-slot', (_e, { trackIndex, clipIndex, filePath }) => loadFileIntoSlot(trackIndex, clipIndex, filePath));
+
+// --- live helpers ---------------------------------------------------------
+function launchLive() {
+  const candidates = [
+    'C:\\ProgramData\\Ableton\\Live 12 Suite\\Program\\Live.exe',
+    'C:\\ProgramData\\Ableton\\Live 12 Standard\\Program\\Live.exe',
+    'C:\\ProgramData\\Ableton\\Live 11 Suite\\Program\\Live.exe',
+  ];
+  const found = candidates.find(p => fs.existsSync(p));
+  if (found) return shell.openPath(found);
+  return shell.openPath('C:\\ProgramData\\Ableton');
+}
+
+function installRemoteScript() {
+  const src = path.join(__dirname, 'ableton_bridge');
+  const dest = path.join(resolveRemoteScriptsDir(), 'ableton_bridge');
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  let filesCopied = 0;
+  function copyDir(s, d) {
+    fs.mkdirSync(d, { recursive: true });
+    for (const f of fs.readdirSync(s)) {
+      const sp = path.join(s, f), dp = path.join(d, f);
+      if (fs.statSync(sp).isDirectory()) copyDir(sp, dp);
+      else { fs.copyFileSync(sp, dp); filesCopied++; }
+    }
+  }
+  copyDir(src, dest);
+  return { destPath: dest, filesCopied, replaced: true, restart: { status: 'pending' } };
+}
