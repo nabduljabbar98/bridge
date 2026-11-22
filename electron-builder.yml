@@ -1,0 +1,25 @@
+appId: com.elevenlabs.bridge
+productName: ElevenLabs Bridge
+directories:
+  output: release
+  buildResources: assets
+files:
+  - app/**/*
+  - electron/**/*
+  - assets/**/*
+  - elevenlabs/**/*
+  - package.json
+  - suno-control/**/*
+win:
+  target:
+    - nsis
+    - portable
+  icon: assets/icon.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: assets/icon.ico
+  uninstallerIcon: assets/icon.ico
+publish:
+  provider: generic
+  url: https://example.com

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bridge</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="shell">
+  <aside class="nav">
+    <div class="brand">bridge</div>
+    <button class="nav-item active" data-screen="status">status</button>
+    <button class="nav-item" data-screen="generate">generate</button>
+    <button class="nav-item" data-screen="settings">settings</button>
+  </aside>
+  <main class="content">
+
+    <section class="screen active" id="screen-status">
+      <h1>status</h1>
+      <div class="card">
+        <div class="row"><span>ableton live</span><span id="ableton-status" class="badge">checking</span></div>
+        <div class="row"><span>osc link</span><span id="osc-status" class="badge">checking</span></div>
+        <div class="row"><span>remote script</span><span id="script-status" class="badge">unknown</span></div>
+        <div class="actions">
+          <button id="btn-refresh-status">refresh</button>
+          <button id="btn-install-script">install remote script</button>
+        </div>
+        <p class="hint" id="scripts-dir"></p>
+      </div>
+      <div class="card">
+        <h2>quick start</h2>
+        <ol>
+          <li>install the remote script, then restart ableton live.</li>
+          <li>enable "bridge" in ableton preferences &gt; link/midi &gt; control surface.</li>
+          <li>set your elevenlabs api key in settings.</li>
+          <li>pick a loop range in ableton, then generate.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-generate">
+      <h1>generate</h1>
+      <div class="card">
+        <label>prompt</label>
+        <textarea id="prompt" rows="4" placeholder="describe the sound you want..."></textarea>
+        <div class="grid2">
+          <div>
+            <label>duration (seconds)</label>
+            <input type="range" id="duration" min="3" max="300" value="30" />
+            <span id="duration-val">30s</span>
+          </div>
+          <div>
+            <label>model</label>
+            <select id="model">
+              <option value="music_v1">music v1</option>
+              <option value="music_v2">music v2</option>
+              <option value="music_v2_5">music v2.5</option>
+            </select>
+          </div>
+        </div>
+        <label class="checkbox"><input type="checkbox" id="instrumental" /> instrumental only</label>
+        <div class="actions">
+          <button id="btn-generate" class="primary">generate</button>
+        </div>
+        <p class="status" id="gen-status"></p>
+      </div>
+      <div class="card" id="result-card" hidden>
+        <h2>result</h2>
+        <audio id="result-audio" controls></audio>
+        <div class="actions">
+          <button id="btn-open-result">open file</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-settings">
+      <h1>settings</h1>
+      <div class="card">
+        <label>elevenlabs api key</label>
+        <input type="password" id="api-key" placeholder="xi-api-key..." />
+        <label>remote scripts folder</label>
+        <input type="text" id="scripts-folder" readonly />
+        <div class="actions">
+          <button id="btn-save-settings" class="primary">save</button>
+        </div>
+        <p class="status" id="settings-status"></p>
+      </div>
+      <div class="card">
+        <h2>about</h2>
+        <p>bridge generates music with elevenlabs and drops it into ableton live. no login required.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+{
+  "name": "elevenlabs-bridge",
+  "productName": "ElevenLabs Bridge",
+  "version": "0.7.34",
+  "private": true,
+  "description": "ElevenLabs Bridge - Ableton Live integration (Windows) using ElevenLabs Music API",
+  
+  "main": "main.js",
+  "scripts": {
+    "bootstrap": "node node_modules/electron/install.js && node node_modules/esbuild/install.js && node scripts/rebuild-dmg-natives.cjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.renderer.json",
+    "test": "vitest run",
+    "test:screens": "vitest run --config vitest.screens.config.ts",
+    "test:screens:watch": "vitest --config vitest.screens.config.ts",
+    "build": "node esbuild.config.mjs",
+    "dev": "node esbuild.config.mjs --watch",
+    "start": "pnpm install --filter suno-link... && pnpm bootstrap && node esbuild.config.mjs && electron-forge start",
+    "make": "node esbuild.config.mjs && node scripts/generate-dmg-background.mjs && electron-forge make",
+    "package": "node esbuild.config.mjs && electron-forge package"
+  },
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@statsig/js-client": "3.25.5",
+    "archiver": "^7.0.1",
+    "cheerio": "^1.2.0",
+    "electron-updater": ">=6.6.2 <7",
+    "react": "19.0.4",
+    "react-dom": "19.0.4",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.6.0",
+    "@electron-forge/maker-dmg": "^7.6.0",
+    "@electron-forge/maker-zip": "^7.6.0",
+    "@electron-forge/plugin-fuses": "7.11.1",
+    "@electron/fuses": "1.8.0",
+    "@tailwindcss/postcss": "^4.1.11",
+    "@types/archiver": "^7.0.0",
+    "@types/node": "^22.13.1",
+    "@types/react": "19.0.10",
+    "@types/react-dom": "19.0.4",
+    "@types/ws": "^8.18.1",
+    "@vitest/browser-playwright": "5.0.0",
+    "domhandler": "^5.0.3",
+    "electron": "^41.1.1",
+    "electron-builder": ">=26.15.3 <27",
+    "esbuild": "0.27.7",
+    "playwright": "1.54.1",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^4.1.11",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "5.0.0",
+    "wrangler": "^4.81.0"
+  }
+}
+
+
+
