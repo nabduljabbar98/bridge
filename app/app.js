@@ -94,4 +94,21 @@ $('#btn-open-result').addEventListener('click', () => {
   if (lastResult) bridge.openPath(lastResult);
 });
 
+$('#btn-send-ableton').addEventListener('click', async () => {
+  if (!lastResult) return;
+  $('#send-status').textContent = 'sending...';
+  $('#send-status').className = 'status';
+  try {
+    const tracks = await bridge.trackCount();
+    const trackIndex = parseInt($('#track-index').value, 10);
+    const clipIndex = parseInt($('#clip-index').value, 10);
+    if (trackIndex >= tracks) throw new Error(`track ${trackIndex} out of range (0-${tracks - 1})`);
+    await bridge.loadFileIntoSlot({ trackIndex, clipIndex, filePath: lastResult });
+    $('#send-status').textContent = `loaded into track ${trackIndex}, slot ${clipIndex}.`;
+  } catch (e) {
+    $('#send-status').textContent = 'error: ' + e.message;
+    $('#send-status').className = 'status err';
+  }
+});
+
 refreshStatus();

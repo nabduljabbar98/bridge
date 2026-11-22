@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld('bridge', {
   remoteScriptsDir: () => ipcRenderer.invoke('remote-scripts-dir'),
   installRemoteScript: () => ipcRenderer.invoke('install-remote-script'),
   generateMusic: (opts) => ipcRenderer.invoke('generate-music', opts),
+  trackCount: () => ipcRenderer.invoke('track-count'),
+  loadFileIntoSlot: (opts) => ipcRenderer.invoke('load-file-into-slot', opts),
   openPath: (p) => ipcRenderer.invoke('open-path', p),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
 });

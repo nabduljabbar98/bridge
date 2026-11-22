@@ -45,24 +45,85 @@ function detectAbleton() {
   });
 }
 
-// Minimal OSC client: send a message, wait for reply on response port
-function oscPing(timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const sock = dgram.createSocket('udp4');
-    const msg = buildOscMessage('/live/ping', []);
-    let done = false;
-    const timer = setTimeout(() => { if (!done) { done = true; try { sock.close(); } catch {} resolve(false); } }, timeoutMs);
-    sock.on('message', (buf) => {
-      // parse address
-      const addr = readOscString(buf, 0);
-      if (addr.str === '/live/ping' && !done) {
-        done = true; clearTimeout(timer); try { sock.close(); } catch {} resolve(true);
+// --- OSC client -----------------------------------------------------------
+// Ableton's remote script listens on 11000 and replies to 11001.
+const OSC_SEND_PORT = 11000;
+const OSC_REPLY_PORT = 11001;
+
+let oscSocket = null;
+const oscPending = new Map(); // address -> { resolve, timer }
+
+function getOscSocket() {
+  if (oscSocket) return oscSocket;
+  oscSocket = dgram.createSocket('udp4');
+  oscSocket.on('message', (buf) => {
+    const addr = readOscString(buf, 0);
+    const key = addr.str;
+    const waiter = oscPending.get(key);
+    if (waiter) {
+      oscPending.delete(key);
+      clearTimeout(waiter.timer);
+      waiter.resolve(parseOscArgs(buf));
+    }
+  });
+  oscSocket.on('error', () => {});
+  oscSocket.bind(OSC_REPLY_PORT, '127.0.0.1');
+  return oscSocket;
+}
+
+function oscSend(address, args = [], { expectReply = false, timeoutMs = 3000 } = {}) {
+  const sock = getOscSocket();
+  const msg = buildOscMessage(address, args);
+  return new Promise((resolve, reject) => {
+    if (expectReply) {
+      const timer = setTimeout(() => {
+        oscPending.delete(address);
+        reject(new Error(`No reply from Ableton for ${address}`));
+      }, timeoutMs);
+      oscPending.set(address, { resolve, timer });
+    }
+    sock.send(msg, OSC_SEND_PORT, '127.0.0.1', (err) => {
+      if (err) {
+        if (expectReply) { oscPending.delete(address); clearTimeout(oscPending.get(address)?.timer); }
+        reject(err);
+      } else if (!expectReply) {
+        resolve(true);
       }
     });
-    sock.bind(11001, '127.0.0.1', () => {
-      sock.send(msg, 11000, '127.0.0.1');
-    });
   });
+}
+
+function parseOscArgs(buf) {
+  const addr = readOscString(buf, 0);
+  const tags = readOscString(buf, addr.next);
+  const types = tags.str.slice(1);
+  const args = [];
+  let off = tags.next;
+  for (const t of types) {
+    if (t === 'i') { args.push(buf.readInt32BE(off)); off += 4; }
+    else if (t === 'f') { args.push(buf.readFloatBE(off)); off += 4; }
+    else if (t === 's') { const s = readOscString(buf, off); args.push(s.str); off = s.next; }
+    else if (t === 'h' || t === 't') { off += 8; }
+    else break;
+  }
+  return { address: addr.str, args };
+}
+
+async function oscPing() {
+  try {
+    const r = await oscSend('/live/ping', [], { expectReply: true, timeoutMs: 1500 });
+    return Array.isArray(r.args) && r.args[0] === 'ok';
+  } catch { return false; }
+}
+
+async function getTrackCount() {
+  const r = await oscSend('/live/song/get/num_tracks', [], { expectReply: true });
+  return Number(r.args[0]) || 0;
+}
+
+async function loadFileIntoSlot(trackIndex, clipIndex, filePath) {
+  await oscSend('/live/clip_slot/load_file', [trackIndex, clipIndex, filePath], { expectReply: false });
+  return { ok: true };
 }
 
 function buildOscMessage(address, args) {
@@ -141,3 +202,5 @@ ipcMain.handle('generate-music', async (_e, opts) => {
 });
 ipcMain.handle('open-path', (_e, p) => shell.openPath(p));
 ipcMain.handle('open-external', (_e, url) => shell.openExternal(url));
+ipcMain.handle('track-count', () => getTrackCount());
+ipcMain.handle('load-file-into-slot', (_e, { trackIndex, clipIndex, filePath }) => loadFileIntoSlot(trackIndex, clipIndex, filePath));
