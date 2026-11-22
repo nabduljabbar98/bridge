@@ -25,9 +25,10 @@ function resolveRemoteScriptsDir() {
         const cfg = path.join(prefsRoot, v, 'Preferences', 'Library.cfg');
         if (fs.existsSync(cfg)) {
           const xml = fs.readFileSync(cfg, 'utf8');
-          const m = xml.match(/ProjectPath[^>]*Value="([^"]+)"[\s\S]*?ProjectName[^>]*Value="([^"]+)"/);
-          if (m && m[1] && m[2] && m[2] !== '.' && m[2] !== '..') {
-            return path.join(m[1], m[2], 'Remote Scripts');
+          const pathMatch = xml.match(/ProjectPath[^>]*Value="([^"]+)"/);
+          const nameMatch = xml.match(/ProjectName[^>]*Value="([^"]+)"/);
+          if (pathMatch && nameMatch && pathMatch[1] && nameMatch[1] && nameMatch[1] !== '.' && nameMatch[1] !== '..') {
+            return path.join(pathMatch[1], nameMatch[1], 'Remote Scripts');
           }
         }
       }
@@ -38,8 +39,8 @@ function resolveRemoteScriptsDir() {
 
 function detectAbleton() {
   return new Promise((resolve) => {
-    exec('tasklist /FI "IMAGENAME eq Live.exe" /NH', (err, stdout) => {
-      const running = !err && /Live\.exe/i.test(stdout);
+    exec('tasklist /NH', (err, stdout) => {
+      const running = !err && /Ableton Live/i.test(stdout);
       resolve({ running });
     });
   });
@@ -146,8 +147,75 @@ async function getTrackCount() {
   return Number(r.args[0]) || 0;
 }
 async function loadFileIntoSlot(trackIndex, clipIndex, filePath) {
-  await oscSend('/live/clip_slot/load_file', [trackIndex, clipIndex, filePath], { expectReply: false });
-  return { ok: true };
+  // Live can only load files that sit inside one of its Browser roots. The User
+  // Library/Samples folder is already a root, so copy the file there first.
+  let target = filePath;
+  try {
+    const dir = importsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    if (!filePath.toLowerCase().startsWith(dir.toLowerCase())) {
+      target = path.join(dir, path.basename(filePath));
+      fs.copyFileSync(filePath, target);
+    }
+  } catch {}
+
+  let track = Number(trackIndex);
+  if (!Number.isInteger(track) || track < 0) {
+    // Create a fresh audio track and put the clip in its first slot.
+    await oscSend('/live/song/create_audio_track', [], { expectReply: false });
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      const nt = await oscSend('/live/song/get/num_tracks', [], { expectReply: true, timeoutMs: 1500 });
+      track = (Number(nt.args[0]) || 1) - 1;
+    } catch { track = 0; }
+  }
+  await oscSend('/live/clip_slot/load_file', [track, clipIndex, target], { expectReply: false });
+  return { ok: true, path: target, trackIndex: track };
+}
+
+function importsDir() {
+  return path.join(path.dirname(resolveRemoteScriptsDir()), 'Samples', 'Bridge Imports');
+}
+
+// --- Ableton live state ----------------------------------------------------
+let abletonState = { connected: false };
+let lastStateJson = '';
+
+async function refreshAbletonState() {
+  try {
+    const ping = await oscSend('/live/ping', [], { expectReply: true, timeoutMs: 1200 });
+    if (!ping || ping.args[0] !== 'ok') throw new Error('no ping');
+    let numTracks = 0;
+    let projectName = 'Untitled';
+    try {
+      const nt = await oscSend('/live/song/get/num_tracks', [], { expectReply: true, timeoutMs: 1200 });
+      numTracks = Number(nt.args[0]) || 0;
+      if (numTracks > 0) {
+        const tn = await oscSend('/live/track/get/name', [0], { expectReply: true, timeoutMs: 1200 });
+        if (tn.args[1]) projectName = String(tn.args[1]);
+      }
+    } catch {}
+    abletonState = {
+      connected: true,
+      filePath: '',
+      projectName,
+      setInstanceId: 'live',
+      numTracks,
+    };
+  } catch {
+    abletonState = { connected: false };
+  }
+  const json = JSON.stringify(abletonState);
+  if (json !== lastStateJson) {
+    lastStateJson = json;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ableton-state', abletonState);
+      mainWindow.webContents.send('ableton-connection-diagnostics', {
+        bound: abletonState.connected, lastError: null,
+      });
+    }
+  }
+  return abletonState;
 }
 
 // --- window ---------------------------------------------------------------
@@ -159,12 +227,12 @@ function createWindow() {
     title: 'Bridge',
     backgroundColor: '#000000',
     webPreferences: {
-      preload: path.join(__dirname, 'electron', 'api', 'loadApi.cjs'),
+      preload: path.join(__dirname, 'preload-local.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
-  mainWindow.loadFile(path.join(__dirname, 'app', 'index.html'));
+  mainWindow.loadFile(path.join(__dirname, 'app', 'local.html'));
   buildMenu();
   if (process.env.BRIDGE_DEVTOOLS === '1') mainWindow.webContents.openDevTools({ mode: 'detach' });
 }
@@ -202,7 +270,11 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  createWindow();
+  refreshAbletonState();
+  setInterval(refreshAbletonState, 3000);
+});
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 
 // --- IPC helpers ----------------------------------------------------------
@@ -301,6 +373,7 @@ const DEFAULTS = {
 
 const OVERRIDDEN = new Set([
   'oauth-status', 'oauth-get-token', 'get-has-completed-first-run', 'set-has-completed-first-run',
+  'oauth-refresh-profile', 'oauth-sign-in',
   'get-app-info', 'get-app-name', 'get-app-version',
   'check-for-ableton-process', 'ableton-open', 'ableton-restart',
   'ableton-state-snapshot', 'ableton-connection-diagnostics-snapshot',
@@ -322,10 +395,15 @@ for (const [channel, value] of Object.entries(DEFAULTS)) {
 }
 
 // identity / first run
-handle('oauth-status', () => ({
-  signedIn: true, displayName: 'local', apiBase: 'local', avatarUrl: null,
-  userId: 'local', email: '', sessionKey: SESSION_KEY, canCreate: true,
-}));
+// identity / first run: local-first, no login
+const LOCAL_API_BASE = 'https://studio-api.prod.elevenlabs.io';
+const LOCAL_PROFILE = {
+  signedIn: true, displayName: 'local', apiBase: LOCAL_API_BASE, avatarUrl: null,
+  userId: 'local', email: '', sessionKey: SESSION_KEY, canCreate: true, canUseStudio: true,
+};
+handle('oauth-status', () => ({ ...LOCAL_PROFILE }));
+handle('oauth-refresh-profile', () => ({ ...LOCAL_PROFILE }));
+handle('oauth-sign-in', () => ({ ...LOCAL_PROFILE }));
 handle('oauth-get-token', () => 'local-token');
 handle('get-has-completed-first-run', () => true);
 handle('set-has-completed-first-run', () => true);
@@ -337,8 +415,8 @@ handle('get-app-version', () => app.getVersion());
 handle('check-for-ableton-process', () => detectAbleton());
 handle('ableton-open', () => launchLive());
 handle('ableton-restart', () => launchLive());
-handle('ableton-state-snapshot', () => null);
-handle('ableton-connection-diagnostics-snapshot', () => ({ bound: false, lastError: null }));
+handle('ableton-state-snapshot', async () => refreshAbletonState());
+handle('ableton-connection-diagnostics-snapshot', () => ({ bound: abletonState.connected, lastError: null }));
 handle('bridge-setup-snapshot', () => {
   const dir = path.join(resolveRemoteScriptsDir(), 'ableton_bridge');
   const installed = fs.existsSync(dir);
@@ -346,7 +424,7 @@ handle('bridge-setup-snapshot', () => {
     installed, health: installed ? 'healthy' : 'missing', detail: null, lastError: null,
     restartRequired: false, busy: false, automaticAction: null,
     destPath: dir, remoteScriptsDir: resolveRemoteScriptsDir(),
-    live: { status: 'unknown' },
+    live: { status: abletonState.connected ? 'running' : 'unknown' },
   };
 });
 handle('bridge-setup-repair', () => installRemoteScript());
@@ -389,12 +467,18 @@ handle('remote-control-stop-import', () => null);
 handle('load-file-into-slot', (_e, { trackIndex, clipIndex, filePath }) => loadFileIntoSlot(trackIndex, clipIndex, filePath));
 handle('track-count', () => getTrackCount());
 handle('osc-ping', () => oscPing());
+handle('get-settings', () => loadSettings());
+handle('save-settings', (_e, s) => { saveSettings(s); return true; });
+handle('detect-ableton', () => detectAbleton());
+handle('remote-scripts-dir', () => resolveRemoteScriptsDir());
+handle('install-remote-script', () => installRemoteScript());
+handle('open-path', (_e, p) => shell.openPath(p));
 handle('generate-music', async (_e, opts) => {
   const settings = loadSettings();
   const apiKey = settings.elevenlabsApiKey || opts.apiKey;
   if (!apiKey) throw new Error('ElevenLabs API key not set');
   const music = require('./elevenlabs/music.js');
-  const outDir = path.join(app.getPath('music'), 'Bridge', 'generated');
+  const outDir = importsDir();
   fs.mkdirSync(outDir, { recursive: true });
   const dest = path.join(outDir, `gen-${Date.now()}.mp3`);
   await music.composeToFile({ apiKey, prompt: opts.prompt, musicLengthMs: opts.durationMs, modelId: opts.modelId, forceInstrumental: opts.instrumental }, dest);
